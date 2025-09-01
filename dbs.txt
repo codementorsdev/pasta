@@ -1,0 +1,66 @@
+-- No need to create a user like in H2; PostgreSQL user management is different and external to schemas.
+
+-- Schema (if needed)
+CREATE SCHEMA IF NOT EXISTS public;
+
+-- Table: applications
+CREATE TABLE public.applications (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMP(6) NOT NULL,
+    gitlab_project_id VARCHAR(255) NOT NULL,
+    personal_access_token VARCHAR(255) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL
+);
+
+-- Table: flow_executions
+CREATE TABLE public.flow_executions (
+    id UUID PRIMARY KEY,
+    created_at TIMESTAMP(6) NOT NULL,
+    end_time TIMESTAMP(6),
+    flow_id BIGINT NOT NULL,
+    global_variables JSON,
+    runtime_variables JSON,
+    start_time TIMESTAMP(6),
+    status VARCHAR(255),
+    CONSTRAINT chk_flow_executions_status CHECK (status IN ('RUNNING', 'PASSED', 'FAILED', 'CANCELLED'))
+);
+
+-- Table: flow_steps
+CREATE TABLE public.flow_steps (
+    id BIGSERIAL PRIMARY KEY,
+    application_id BIGINT NOT NULL,
+    branch VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    initial_test_data JSON,
+    squash_step_ids JSON,
+    test_stage VARCHAR(255) NOT NULL,
+    test_tag VARCHAR(255) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL
+);
+
+-- Table: flows
+CREATE TABLE public.flows (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMP(6) NOT NULL,
+    flow_step_ids JSON NOT NULL,
+    global_variables JSON,
+    squash_test_case_id BIGINT NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL
+);
+
+-- Table: pipeline_executions
+CREATE TABLE public.pipeline_executions (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMP(6) NOT NULL,
+    end_time TIMESTAMP(6),
+    flow_execution_id UUID NOT NULL,
+    flow_id BIGINT NOT NULL,
+    flow_step_id BIGINT NOT NULL,
+    initial_test_data JSON,
+    pipeline_id BIGINT,
+    pipeline_url VARCHAR(255),
+    runtime_test_data JSON,
+    start_time TIMESTAMP(6),
+    status VARCHAR(255),
+    CONSTRAINT chk_pipeline_executions_status CHECK (status IN ('RUNNING', 'PASSED', 'FAILED', 'CANCELLED'))
+);
