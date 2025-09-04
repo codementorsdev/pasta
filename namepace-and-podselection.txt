@@ -1,0 +1,285 @@
+Nice — below are small, copy-pasteable Spring Boot additions that provide the REST endpoints your Next.js app needs:
+
+* `GET /api/k8s/namespaces` → returns list of namespaces (name + optional metadata)
+* `GET /api/k8s/namespaces/{namespace}/pods` → returns pods in that namespace with useful info (name, phase, node, containers, labels)
+
+I kept the implementation simple, robust, and ready for dropdown UIs. It uses your existing `io.fabric8.kubernetes.client.KubernetesClient` bean (from the Fabric8 client you already added). It also includes a tiny in-memory TTL cache to reduce Kube API calls while users navigate the UI.
+
+Files to add (copy into your project under `com.example.k8slogs` or adjust package names to your project):
+
+---
+
+### 1) `KubernetesMetadataService.java`
+
+```java
+package com.example.k8slogs.service;
+
+import io.fabric8.kubernetes.api.model.Container;
+import io.fabric8.kubernetes.api.model.Pod;
+import io.fabric8.kubernetes.api.model.PodStatus;
+import io.fabric8.kubernetes.api.model.Namespace;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.time.Instant;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Service
+public class KubernetesMetadataService {
+    private static final Logger log = LoggerFactory.getLogger(KubernetesMetadataService.class);
+
+    private final KubernetesClient client;
+
+    // simple TTL cache to reduce pressure on Kube API while the user clicks dropdowns
+    private volatile CachedNamespaces cachedNamespaces = new CachedNamespaces(Collections.emptyList(), Instant.EPOCH);
+    private final Map<String, CachedPods> podsCache = new ConcurrentHashMap<>();
+
+    // default TTL 5 seconds; override in application.yml with app.kubernetes.cache-ttl-seconds
+    private final long cacheTtlSeconds;
+
+    public KubernetesMetadataService(KubernetesClient client,
+                                     @Value("${app.kubernetes.cache-ttl-seconds:5}") long cacheTtlSeconds) {
+        this.client = client;
+        this.cacheTtlSeconds = Math.max(1, cacheTtlSeconds);
+    }
+
+    public List<String> listNamespaces() {
+        Instant now = Instant.now();
+        if (cachedNamespaces.expiresAt.isAfter(now)) {
+            return cachedNamespaces.namespaces;
+        }
+
+        try {
+            List<Namespace> items = client.namespaces().list().getItems();
+            List<String> names = items.stream()
+                    .map(n -> n.getMetadata() != null ? n.getMetadata().getName() : null)
+                    .filter(Objects::nonNull)
+                    .sorted()
+                    .collect(Collectors.toList());
+
+            cachedNamespaces = new CachedNamespaces(names, now.plusSeconds(cacheTtlSeconds));
+            return names;
+        } catch (Exception e) {
+            log.error("Failed to list namespaces: {}", e.getMessage(), e);
+            // fallback to cached (even stale) if exists
+            return cachedNamespaces.namespaces;
+        }
+    }
+
+    public List<PodSummary> listPods(String namespace) {
+        Instant now = Instant.now();
+        CachedPods cp = podsCache.get(namespace);
+        if (cp != null && cp.expiresAt.isAfter(now)) {
+            return cp.pods;
+        }
+
+        try {
+            List<Pod> items = client.pods().inNamespace(namespace).list().getItems();
+            List<PodSummary> pods = items.stream()
+                    .map(p -> {
+                        PodStatus status = p.getStatus();
+                        String phase = status != null ? status.getPhase() : null;
+                        String nodeName = status != null ? status.getHostIP() : null;
+                        if (nodeName == null && status != null && status.getHostIP() == null) {
+                            nodeName = p.getSpec() != null ? p.getSpec().getNodeName() : null;
+                        }
+                        List<String> containerNames = Optional.ofNullable(p.getSpec())
+                                .map(spec -> spec.getContainers())
+                                .map(list -> list.stream().map(Container::getName).collect(Collectors.toList()))
+                                .orElse(Collections.emptyList());
+                        Map<String, String> labels = Optional.ofNullable(p.getMetadata())
+                                .map(m -> m.getLabels())
+                                .orElse(Collections.emptyMap());
+                        return new PodSummary(
+                                Optional.ofNullable(p.getMetadata()).map(m -> m.getName()).orElse(""),
+                                phase,
+                                nodeName,
+                                containerNames,
+                                labels
+                        );
+                    })
+                    .sorted(Comparator.comparing(ps -> ps.getName()))
+                    .collect(Collectors.toList());
+
+            podsCache.put(namespace, new CachedPods(pods, now.plusSeconds(cacheTtlSeconds)));
+            return pods;
+        } catch (Exception e) {
+            log.error("Failed to list pods for namespace {}: {}", namespace, e.getMessage(), e);
+            // fallback to cached value if present
+            return cp != null ? cp.pods : Collections.emptyList();
+        }
+    }
+
+    // --- simple POJOs for internal caching ---
+    private static class CachedNamespaces {
+        final List<String> namespaces;
+        final Instant expiresAt;
+        CachedNamespaces(List<String> namespaces, Instant expiresAt) { this.namespaces = namespaces; this.expiresAt = expiresAt; }
+    }
+
+    private static class CachedPods {
+        final List<PodSummary> pods;
+        final Instant expiresAt;
+        CachedPods(List<PodSummary> pods, Instant expiresAt) { this.pods = pods; this.expiresAt = expiresAt; }
+    }
+
+    // --- DTO returned to controller ---
+    public static class PodSummary {
+        private final String name;
+        private final String phase;
+        private final String nodeName;
+        private final List<String> containers;
+        private final Map<String, String> labels;
+
+        public PodSummary(String name, String phase, String nodeName, List<String> containers, Map<String, String> labels) {
+            this.name = name;
+            this.phase = phase;
+            this.nodeName = nodeName;
+            this.containers = containers != null ? containers : Collections.emptyList();
+            this.labels = labels != null ? labels : Collections.emptyMap();
+        }
+
+        public String getName() { return name; }
+        public String getPhase() { return phase; }
+        public String getNodeName() { return nodeName; }
+        public List<String> getContainers() { return containers; }
+        public Map<String, String> getLabels() { return labels; }
+    }
+}
+```
+
+---
+
+### 2) `K8sApiController.java`
+
+```java
+package com.example.k8slogs.api;
+
+import com.example.k8slogs.service.KubernetesMetadataService;
+import com.example.k8slogs.service.KubernetesMetadataService.PodSummary;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/k8s")
+@CrossOrigin(origins = "http://localhost:3000") // Next.js dev origin; change to your allowed origin(s) in prod
+public class K8sApiController {
+    private static final Logger log = LoggerFactory.getLogger(K8sApiController.class);
+
+    private final KubernetesMetadataService metaService;
+
+    public K8sApiController(KubernetesMetadataService metaService) {
+        this.metaService = metaService;
+    }
+
+    /**
+     * GET /api/k8s/namespaces
+     * Returns: ["default", "kube-system", "my-ns", ...]
+     */
+    @GetMapping("/namespaces")
+    public ResponseEntity<List<String>> namespaces() {
+        List<String> list = metaService.listNamespaces();
+        return ResponseEntity.ok(list);
+    }
+
+    /**
+     * GET /api/k8s/namespaces/{namespace}/pods
+     * Returns: [{ name, phase, nodeName, containers: [...], labels: { ... } }, ...]
+     */
+    @GetMapping("/namespaces/{namespace}/pods")
+    public ResponseEntity<List<PodSummary>> pods(@PathVariable("namespace") String namespace) {
+        if (namespace == null || namespace.isBlank()) {
+            return ResponseEntity.badRequest().build();
+        }
+        List<PodSummary> pods = metaService.listPods(namespace);
+        return ResponseEntity.ok(pods);
+    }
+}
+```
+
+---
+
+### 3) Example `application.yml` additions (optional)
+
+Add or extend these properties (you already have `app.*` keys). This makes the cache TTL configurable and documents the CORS dev origin:
+
+```yaml
+app:
+  kubernetes:
+    cache-ttl-seconds: 5   # TTL used by the namespace/pod cache (default 5s)
+  # ...existing keys...
+```
+
+If you prefer to allow multiple origins for the controller, replace the `@CrossOrigin` with a global CORS configuration (I can provide that if you want).
+
+---
+
+### 4) Example JSON responses
+
+`GET /api/k8s/namespaces`
+
+```json
+["default","crdb-account-consumer-qa","kube-system"]
+```
+
+`GET /api/k8s/namespaces/crdb-account-consumer-qa/pods`
+
+```json
+[
+  {
+    "name": "crdb-account-consumer-56f8b98b7d-mp9xc",
+    "phase": "Running",
+    "nodeName": "ip-10-0-5-123.ec2.internal",
+    "containers": ["account-consumer"],
+    "labels": { "app": "crdb-account-consumer", "pod-template-hash": "56f8b98b7d" }
+  },
+  ...
+]
+```
+
+---
+
+### 5) Next.js usage hints (client-side)
+
+* Call `GET http://localhost:8182/api/k8s/namespaces` to populate the namespace dropdown.
+* On namespace change, call `GET http://localhost:8182/api/k8s/namespaces/{namespace}/pods` to populate the pods dropdown.
+* You can display `pod.name` in the dropdown and, when user selects a pod, use the name + namespace to open the WebSocket like you already have.
+
+Example `fetch`:
+
+```js
+// get namespaces
+const res = await fetch('http://localhost:8182/api/k8s/namespaces');
+const namespaces = await res.json();
+
+// get pods in namespace
+const res2 = await fetch(`http://localhost:8182/api/k8s/namespaces/${encodeURIComponent(ns)}/pods`);
+const pods = await res2.json();
+```
+
+---
+
+### Notes & recommendations
+
+* I used `@CrossOrigin(origins = "http://localhost:3000")` for development. In production, replace with your Next.js app origin(s) or implement a global `WebMvcConfigurer` that reads allowed origins from configuration.
+* The small TTL cache reduces the number of Kube API calls while the user interacts with the UI. Tune `app.kubernetes.cache-ttl-seconds` as needed.
+* The controller returns concise JSON DTOs (no Fabric8 classes leaked to the client).
+* The service catches exceptions and returns cached results if available to keep the UI responsive even if the Kube API temporarily errors.
+
+---
+
+If you want, I can also:
+
+* Add a global CORS config (reads allowed origins from `application.yml`),
+* Add label/select filtering (e.g., `?labelSelector=app=foo`) so the frontend can request only pods matching a selector,
+* Return pod readiness / container statuses (ready/not-ready counts) if you want more UI signals.
+
+Which of those should I add next?
