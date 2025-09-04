@@ -559,3 +559,176 @@ If you want, I can:
 * Or provide a `kubectl` fallback implementation instead of Fabric8.
 
 Tell me which of those you want and I’ll extend the code (I’ll just add it directly — no waiting).
+
+
+Updated Kubernetes Log Service
+
+package com.example.k8slogs.service;
+
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.dsl.LogWatch;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.channels.ClosedByInterruptException;
+import java.time.Instant;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.concurrent.*;
+import java.util.function.Consumer;
+
+@Service
+public class KubernetesLogService {
+    private static final Logger logger = LoggerFactory.getLogger(KubernetesLogService.class);
+
+    private final KubernetesClient client;
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+    private final ExecutorService workerPool = Executors.newCachedThreadPool();
+    private final ConcurrentMap<UUID, Future<?>> tasks = new ConcurrentHashMap<>();
+    private final ConcurrentMap<UUID, LogWatch> watches = new ConcurrentHashMap<>();
+
+    public KubernetesLogService(KubernetesClient client) {
+        this.client = client;
+    }
+
+    /**
+     * Stream logs for the given pod. Returns a UUID that can be used to cancel the stream.
+     */
+    public UUID streamPodLogs(String namespace,
+                              String podName,
+                              String containerName,
+                              int tailLines,
+                              long durationSecs,
+                              Consumer<String> lineConsumer) {
+
+        Objects.requireNonNull(namespace, "namespace required");
+        Objects.requireNonNull(podName, "podName required");
+        Objects.requireNonNull(lineConsumer, "lineConsumer required");
+
+        UUID id = UUID.randomUUID();
+
+        Runnable task = () -> {
+            LogWatch watch = null;
+            try {
+                logger.info("Opening log watch for pod {}/{} (container={}, tailLines={})", namespace, podName, containerName, tailLines);
+
+                if (containerName != null && !containerName.isEmpty()) {
+                    watch = client.pods()
+                            .inNamespace(namespace)
+                            .withName(podName)
+                            .inContainer(containerName)
+                            .tailingLines(tailLines)
+                            .watchLog();
+                } else {
+                    watch = client.pods()
+                            .inNamespace(namespace)
+                            .withName(podName)
+                            .tailingLines(tailLines)
+                            .watchLog();
+                }
+
+                watches.put(id, watch);
+                InputStream is = watch.getOutput();
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(is))) {
+                    String line;
+                    Instant end = Instant.now().plusSeconds(durationSecs);
+                    while (!Thread.currentThread().isInterrupted() && (line = reader.readLine()) != null) {
+                        try {
+                            lineConsumer.accept(line);
+                        } catch (Exception consumerEx) {
+                            logger.warn("Consumer threw exception while processing a log line for stream {}: {}", id, consumerEx.getMessage(), consumerEx);
+                        }
+
+                        if (Instant.now().isAfter(end)) {
+                            logger.debug("Requested duration reached for stream {}", id);
+                            break;
+                        }
+                    }
+                }
+            } catch (ClosedByInterruptException cbi) {
+                // This occurs when the thread was interrupted while blocked on IO. Treat as graceful termination.
+                logger.info("Log stream {} interrupted (ClosedByInterrupt). Treating as closed.", id);
+            } catch (InterruptedException ie) {
+                // If any code throws InterruptedException, restore and exit loop
+                Thread.currentThread().interrupt();
+                logger.info("Log stream {} interrupted via InterruptedException.", id);
+            } catch (Exception e) {
+                // For real unexpected exceptions, log at error but keep it concise.
+                logger.error("Error streaming logs for {}:{} - {}", namespace, podName, e.getMessage());
+                try {
+                    lineConsumer.accept("[ERROR] " + e.getMessage());
+                } catch (Exception ignore) {}
+            } finally {
+                // Best-effort cleanup
+                try {
+                    LogWatch lw = watches.remove(id);
+                    if (lw != null) {
+                        try { lw.close(); } catch (Exception ignored) {}
+                    }
+                } catch (Exception ignored) {}
+                tasks.remove(id);
+                logger.info("Closed log stream {}", id);
+            }
+        };
+
+        Future<?> future = workerPool.submit(task);
+        tasks.put(id, future);
+
+        // schedule a safe cancel after durationSecs + small buffer
+        scheduler.schedule(() -> cancelStream(id), durationSecs + 5, TimeUnit.SECONDS);
+
+        return id;
+    }
+
+    /**
+     * Cancel an active stream (if running). Closes the LogWatch first to unblock reads, then cancels the task
+     * without interrupting it immediately. If it still does not finish, force-interrupt after a short delay.
+     */
+    public boolean cancelStream(UUID id) {
+        boolean hadWatch = false;
+        boolean hadTask = false;
+
+        // 1) Close the LogWatch first to unblock any readLine()
+        LogWatch lw = watches.remove(id);
+        if (lw != null) {
+            hadWatch = true;
+            try {
+                lw.close();
+            } catch (Exception e) {
+                logger.debug("Exception while closing LogWatch for {}: {}", id, e.getMessage());
+            }
+        }
+
+        // 2) Cancel the task gently (no immediate interrupt)
+        Future<?> f = tasks.get(id);
+        if (f != null) {
+            hadTask = true;
+            boolean cancelled = f.cancel(false); // do NOT interrupt immediately
+            if (!cancelled) {
+                // schedule a forced interrupt if still not done after 3 seconds
+                UUID uid = id;
+                scheduler.schedule(() -> {
+                    Future<?> ff = tasks.get(uid);
+                    if (ff != null && !ff.isDone()) {
+                        logger.warn("Force-interrupting log stream task {}", uid);
+                        ff.cancel(true); // last resort
+                    }
+                }, 3, TimeUnit.SECONDS);
+            } else {
+                // if cancelled successfully, remove from map
+                tasks.remove(id);
+            }
+        } else {
+            // nothing to cancel
+            tasks.remove(id);
+        }
+
+        logger.info("cancelStream({}) invoked (hadWatch={}, hadTask={})", id, hadWatch, hadTask);
+        return hadWatch || hadTask;
+    }
+}
+
