@@ -1,0 +1,544 @@
+Nice — below is a copy-pasteable implementation that lets your Spring Boot app connect to Kubernetes, tail the **latest logs** of a pod (optionally tail X lines from the end), stream them for a **configurable duration**, and push each log line to a WebSocket session (one session per client). I use the Fabric8 Kubernetes Client (widely used in Java apps) and Spring’s `WebSocketHandler` (no STOMP — lightweight and low-latency).
+
+I include:
+
+* Maven dependencies you can drop into your `pom.xml`
+* `application.yml` properties
+* Spring beans & services:
+
+  * `KubernetesClientConfig` — builds the Fabric8 client (uses in-cluster config or your kubeconfig)
+  * `KubernetesLogService` — core: starts/stops log streaming threads, reads lines and forwards to a consumer
+  * `LogWebSocketHandler` — WebSocket handler that accepts query params for `pod`, `namespace`, `durationSeconds`, `tailLines` and streams logs to the client
+  * `WebSocketConfig` — registers the handler
+* A small JS client snippet to test
+* Notes & alternatives
+
+> Important: Fabric8 will pick up in-cluster config when running inside k8s, or `~/.kube/config` when running from dev machine. If you want `kubectl` fallback instead, see the “Notes & alternatives” at the end.
+
+---
+
+# 1) Maven dependencies (snippet for `pom.xml`)
+
+Add these dependencies inside `<dependencies>` (replace versions with latest if you prefer):
+
+```xml
+<!-- Spring Boot starters -->
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-web</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-websocket</artifactId>
+</dependency>
+
+<!-- Fabric8 Kubernetes Client -->
+<dependency>
+  <groupId>io.fabric8</groupId>
+  <artifactId>kubernetes-client</artifactId>
+  <version>6.4.0</version> <!-- replace with a compatible/latest version if needed -->
+</dependency>
+
+<!-- Optional: Lombok (if you like) -->
+<dependency>
+  <groupId>org.projectlombok</groupId>
+  <artifactId>lombok</artifactId>
+  <optional>true</optional>
+</dependency>
+```
+
+---
+
+# 2) `application.yml` (configurable values)
+
+```yaml
+app:
+  kubernetes:
+    default-namespace: default
+  logs:
+    default-duration-seconds: 60   # default streaming duration
+    default-tail-lines: 200        # default lines from the end
+    max-duration-seconds: 600     # safety cap (stop after this many seconds)
+    max-tail-lines: 5000          # safety cap
+```
+
+---
+
+# 3) Java code files
+
+Create these files under your Spring Boot project (packages shown as `com.example.k8slogs` — adjust to your package structure).
+
+---
+
+### `KubernetesClientConfig.java`
+
+```java
+package com.example.k8slogs.config;
+
+import io.fabric8.kubernetes.client.Config;
+import io.fabric8.kubernetes.client.DefaultKubernetesClient;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class KubernetesClientConfig {
+
+    @Bean(destroyMethod = "close")
+    public KubernetesClient kubernetesClient() {
+        // Fabric8 will auto-detect in-cluster or local kubeconfig.
+        Config config = Config.autoConfigure(null);
+        return new DefaultKubernetesClient(config);
+    }
+}
+```
+
+---
+
+### `LogProperties.java`
+
+```java
+package com.example.k8slogs.config;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.stereotype.Component;
+
+@Component
+@ConfigurationProperties(prefix = "app")
+public class LogProperties {
+    private Kubernetes kubernetes = new Kubernetes();
+    private Logs logs = new Logs();
+
+    public static class Kubernetes {
+        private String defaultNamespace = "default";
+        public String getDefaultNamespace() { return defaultNamespace; }
+        public void setDefaultNamespace(String defaultNamespace) { this.defaultNamespace = defaultNamespace; }
+    }
+
+    public static class Logs {
+        private int defaultDurationSeconds = 60;
+        private int defaultTailLines = 200;
+        private int maxDurationSeconds = 600;
+        private int maxTailLines = 5000;
+
+        public int getDefaultDurationSeconds() { return defaultDurationSeconds; }
+        public void setDefaultDurationSeconds(int defaultDurationSeconds) { this.defaultDurationSeconds = defaultDurationSeconds; }
+        public int getDefaultTailLines() { return defaultTailLines; }
+        public void setDefaultTailLines(int defaultTailLines) { this.defaultTailLines = defaultTailLines; }
+        public int getMaxDurationSeconds() { return maxDurationSeconds; }
+        public void setMaxDurationSeconds(int maxDurationSeconds) { this.maxDurationSeconds = maxDurationSeconds; }
+        public int getMaxTailLines() { return maxTailLines; }
+        public void setMaxTailLines(int maxTailLines) { this.maxTailLines = maxTailLines; }
+    }
+
+    public Kubernetes getKubernetes() { return kubernetes; }
+    public void setKubernetes(Kubernetes kubernetes) { this.kubernetes = kubernetes; }
+    public Logs getLogs() { return logs; }
+    public void setLogs(Logs logs) { this.logs = logs; }
+}
+```
+
+---
+
+### `KubernetesLogService.java`
+
+This is the core service: starts streaming, returns an id and allows cancellation.
+
+```java
+package com.example.k8slogs.service;
+
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.dsl.LogWatch;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.time.Instant;
+import java.util.Map;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.concurrent.*;
+import java.util.function.Consumer;
+
+@Service
+public class KubernetesLogService {
+    private static final Logger logger = LoggerFactory.getLogger(KubernetesLogService.class);
+
+    private final KubernetesClient client;
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
+    private final ExecutorService workerPool = Executors.newCachedThreadPool();
+    private final ConcurrentMap<UUID, Future<?>> tasks = new ConcurrentHashMap<>();
+    private final ConcurrentMap<UUID, LogWatch> watches = new ConcurrentHashMap<>();
+
+    public KubernetesLogService(KubernetesClient client) {
+        this.client = client;
+    }
+
+    /**
+     * Stream logs for the given pod. Returns a UUID that can be used to cancel the stream.
+     *
+     * @param namespace     namespace of pod
+     * @param podName       pod name
+     * @param containerName optional container name (null allowed)
+     * @param tailLines     how many lines from the end to include initially (0 means none)
+     * @param durationSecs  how long (seconds) to stream/tail for (from now)
+     * @param lineConsumer  gets called for each log line (must be fast)
+     * @return stream UUID
+     */
+    public UUID streamPodLogs(String namespace,
+                              String podName,
+                              String containerName,
+                              int tailLines,
+                              long durationSecs,
+                              Consumer<String> lineConsumer) {
+
+        Objects.requireNonNull(namespace, "namespace required");
+        Objects.requireNonNull(podName, "podName required");
+        Objects.requireNonNull(lineConsumer, "lineConsumer required");
+
+        UUID id = UUID.randomUUID();
+
+        Runnable task = () -> {
+            LogWatch watch = null;
+            try {
+                // Build watch: tailingLines available on Fabric8
+                logger.info("Opening log watch for pod {}/{} (container={}, tailLines={})", namespace, podName, containerName, tailLines);
+
+                // fluent API: withName(...).tailingLines(tailLines).watchLog()
+                if (containerName != null && !containerName.isEmpty()) {
+                    watch = client.pods()
+                            .inNamespace(namespace)
+                            .withName(podName)
+                            .inContainer(containerName)
+                            .tailingLines(tailLines)
+                            .watchLog();
+                } else {
+                    watch = client.pods()
+                            .inNamespace(namespace)
+                            .withName(podName)
+                            .tailingLines(tailLines)
+                            .watchLog();
+                }
+
+                watches.put(id, watch);
+                InputStream is = watch.getOutput();
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(is))) {
+                    String line;
+                    Instant end = Instant.now().plusSeconds(durationSecs);
+                    while ((line = reader.readLine()) != null) {
+                        lineConsumer.accept(line);
+                        if (Instant.now().isAfter(end)) {
+                            logger.debug("Reached requested duration for {}", id);
+                            break;
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                logger.error("Error streaming logs for {}:{}, {}", namespace, podName, e.getMessage(), e);
+                // optionally forward the exception as a line:
+                try {
+                    lineConsumer.accept("[ERROR] " + e.getMessage());
+                } catch (Exception ignore) {}
+            } finally {
+                if (watch != null) {
+                    try { watch.close(); } catch (Exception ignored) {}
+                }
+                watches.remove(id);
+                tasks.remove(id);
+                logger.info("Closed log stream {}", id);
+            }
+        };
+
+        Future<?> future = workerPool.submit(task);
+        tasks.put(id, future);
+
+        // schedule a forced cancel after durationSecs + small buffer in case watch doesn't stop
+        scheduler.schedule(() -> cancelStream(id), durationSecs + 10, TimeUnit.SECONDS);
+
+        return id;
+    }
+
+    /**
+     * Cancel an active stream (if running).
+     */
+    public boolean cancelStream(UUID id) {
+        boolean cancelled = false;
+        Future<?> f = tasks.remove(id);
+        if (f != null) {
+            cancelled = f.cancel(true);
+        }
+        LogWatch lw = watches.remove(id);
+        if (lw != null) {
+            try { lw.close(); } catch (Exception ignored) {}
+        }
+        logger.info("Cancelled stream {} (taskCancelled={}, hadWatch={})", id, cancelled, lw != null);
+        return cancelled || (lw != null);
+    }
+}
+```
+
+---
+
+### `LogWebSocketHandler.java`
+
+This handler accepts websocket connections at `/ws/logs` and expects query parameters:
+
+* `pod` (required)
+* `namespace` (optional — defaults to configured default namespace)
+* `container` (optional)
+* `durationSeconds` (optional — default from properties)
+* `tailLines` (optional — default from properties)
+
+Example connect URL:
+`ws://your-host/ws/logs?pod=my-pod&namespace=default&durationSeconds=120&tailLines=300`
+
+```java
+package com.example.k8slogs.websocket;
+
+import com.example.k8slogs.config.LogProperties;
+import com.example.k8slogs.service.KubernetesLogService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.web.socket.*;
+import org.springframework.web.socket.handler.TextWebSocketHandler;
+
+import java.net.URI;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class LogWebSocketHandler extends TextWebSocketHandler {
+    private static final Logger logger = LoggerFactory.getLogger(LogWebSocketHandler.class);
+
+    private final KubernetesLogService logService;
+    private final LogProperties logProperties;
+
+    // map sessionId -> stream UUID so we can cancel when socket closes
+    private final Map<String, UUID> sessionToStream = new ConcurrentHashMap<>();
+
+    public LogWebSocketHandler(KubernetesLogService logService, LogProperties logProperties) {
+        this.logService = logService;
+        this.logProperties = logProperties;
+    }
+
+    @Override
+    public void afterConnectionEstablished(WebSocketSession session) throws Exception {
+        URI uri = session.getUri();
+        if (uri == null) {
+            session.close(CloseStatus.BAD_DATA);
+            return;
+        }
+        Map<String, String> params = parseQueryParams(uri.getQuery());
+
+        String pod = params.get("pod");
+        if (pod == null || pod.isEmpty()) {
+            session.sendMessage(new TextMessage("[ERROR] 'pod' query parameter is required"));
+            session.close(CloseStatus.BAD_DATA);
+            return;
+        }
+
+        String namespace = params.getOrDefault("namespace", logProperties.getKubernetes().getDefaultNamespace());
+        String container = params.get("container");
+        int tailLines = parseIntOrDefault(params.get("tailLines"), logProperties.getLogs().getDefaultTailLines());
+        long durationSeconds = parseLongOrDefault(params.get("durationSeconds"), logProperties.getLogs().getDefaultDurationSeconds());
+
+        // enforce caps
+        tailLines = Math.min(tailLines, logProperties.getLogs().getMaxTailLines());
+        durationSeconds = Math.min(durationSeconds, logProperties.getLogs().getMaxDurationSeconds());
+
+        // start streaming logs, each line sent as a websocket TextMessage
+        UUID streamId = logService.streamPodLogs(
+                namespace,
+                pod,
+                container,
+                tailLines,
+                durationSeconds,
+                line -> {
+                    try {
+                        if (session.isOpen()) {
+                            session.sendMessage(new TextMessage(line));
+                        }
+                    } catch (Exception e) {
+                        logger.warn("Failed to send message to ws session {}, closing stream", session.getId(), e);
+                        // attempt to close session and cancel stream
+                        try { session.close(CloseStatus.SERVER_ERROR); } catch (Exception ignored) {}
+                        logService.cancelStream(streamId);
+                    }
+                }
+        );
+
+        sessionToStream.put(session.getId(), streamId);
+        logger.info("Started log stream {} for ws session {} pod={}/{} container={} duration={}s tailLines={}",
+                streamId, session.getId(), namespace, pod, container, durationSeconds, tailLines);
+    }
+
+    @Override
+    public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
+        UUID streamId = sessionToStream.remove(session.getId());
+        if (streamId != null) {
+            logService.cancelStream(streamId);
+        }
+        logger.info("WebSocket session {} closed; cancelled stream {}", session.getId(), streamId);
+    }
+
+    @Override
+    protected void handleTextMessage(WebSocketSession session, TextMessage message) {
+        // current implementation is one-way (server -> client). We could support commands from client.
+        // For now, echo/ack or ignore.
+        try {
+            session.sendMessage(new TextMessage("[ACK] " + message.getPayload()));
+        } catch (Exception e) {
+            logger.warn("Failed to write ACK to session {}", session.getId(), e);
+        }
+    }
+
+    @Override
+    public void handleTransportError(WebSocketSession session, Throwable exception) {
+        UUID streamId = sessionToStream.remove(session.getId());
+        if (streamId != null) {
+            logService.cancelStream(streamId);
+        }
+        try { session.close(CloseStatus.SERVER_ERROR); } catch (Exception ignore) {}
+        logger.error("Transport error on session {}, closed session and canceled stream {}", session.getId(), streamId, exception);
+    }
+
+    private Map<String, String> parseQueryParams(String rawQuery) {
+        Map<String, String> map = new HashMap<>();
+        if (rawQuery == null || rawQuery.isEmpty()) return map;
+        String[] parts = rawQuery.split("&");
+        for (String p : parts) {
+            int idx = p.indexOf('=');
+            if (idx > 0) {
+                String k = p.substring(0, idx);
+                String v = p.substring(idx + 1);
+                map.put(k, decode(v));
+            } else {
+                map.put(p, "");
+            }
+        }
+        return map;
+    }
+
+    private String decode(String s) {
+        try { return java.net.URLDecoder.decode(s, "UTF-8"); } catch (Exception e) { return s; }
+    }
+
+    private int parseIntOrDefault(String s, int def) {
+        try { return Integer.parseInt(s); } catch (Exception e) { return def; }
+    }
+
+    private long parseLongOrDefault(String s, long def) {
+        try { return Long.parseLong(s); } catch (Exception e) { return def; }
+    }
+}
+```
+
+---
+
+### `WebSocketConfig.java`
+
+Register the handler at `/ws/logs` (no SockJS; plain WebSocket).
+
+```java
+package com.example.k8slogs.config;
+
+import com.example.k8slogs.service.KubernetesLogService;
+import com.example.k8slogs.websocket.LogWebSocketHandler;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.socket.config.annotation.*;
+
+@Configuration
+@EnableWebSocket
+public class WebSocketConfig implements WebSocketConfigurer {
+
+    private final KubernetesLogService logService;
+    private final LogProperties logProperties;
+
+    public WebSocketConfig(KubernetesLogService logService, LogProperties logProperties) {
+        this.logService = logService;
+        this.logProperties = logProperties;
+    }
+
+    @Override
+    public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
+        registry.addHandler(new LogWebSocketHandler(logService, logProperties), "/ws/logs")
+                .setAllowedOrigins("*"); // in prod, limit origins
+    }
+}
+```
+
+---
+
+# 4) JavaScript client (for testing)
+
+Open a raw WebSocket to stream logs:
+
+```html
+<!doctype html>
+<html>
+<body>
+<pre id="out"></pre>
+<script>
+  const pod = "my-pod-name";
+  const namespace = "default";
+  const durationSeconds = 90;
+  const tailLines = 200;
+  const url = `ws://${location.host}/ws/logs?pod=${encodeURIComponent(pod)}&namespace=${encodeURIComponent(namespace)}&durationSeconds=${durationSeconds}&tailLines=${tailLines}`;
+
+  const out = document.getElementById('out');
+  const ws = new WebSocket(url);
+  ws.onopen = () => out.textContent += "[connected]\n";
+  ws.onmessage = e => out.textContent += e.data + "\n";
+  ws.onclose = () => out.textContent += "[closed]\n";
+  ws.onerror = e => out.textContent += "[error] " + JSON.stringify(e) + "\n";
+</script>
+</body>
+</html>
+```
+
+> If you deploy behind a reverse proxy that terminates TLS, use `wss://` accordingly and ensure your proxy forwards WebSocket upgrades.
+
+---
+
+# 5) Usage flow
+
+1. Ensure your app can access Kubernetes cluster: either run inside the cluster (in-cluster config auto detected) or have `~/.kube/config` present and `KUBECONFIG` set.
+2. Start Spring Boot app.
+3. Client connects to `ws://<host>/ws/logs?pod=...&namespace=...&durationSeconds=...&tailLines=...`
+4. Server streams log lines as text messages until `durationSeconds` elapse (or the client disconnects).
+
+---
+
+# 6) Notes, pitfalls & alternatives
+
+* **Fabric8 client version**: I used `io.fabric8:kubernetes-client`. If you get compilation issues, bump the version to a compatible release. The API used (`DefaultKubernetesClient`, `watchLog()`, `tailingLines(int)`, `LogWatch#getOutput()` and `LogWatch#close()`) is the common Fabric8 pattern.
+* **Permissions**: The ServiceAccount (if running in cluster) or kubeconfig must have permission to `get` and `watch` pods/logs in the target namespace.
+* **Container selection**: If your pod has multiple containers, pass `container=containerName` as a query param.
+* **Resource caps**: I enforced `maxDurationSeconds` and `maxTailLines` in `LogProperties` to avoid runaway streams. Tune those to your needs.
+* **kubectl fallback**: If you prefer not to add Fabric8, a fallback is to spawn `kubectl logs <pod> -n <ns> --tail=<n> -f` via `ProcessBuilder` and read `process.getInputStream()` — reliable but requires `kubectl` present and accessible.
+* **Test evidencing**: If you need to save the streamed logs to a file for test evidence, change `lineConsumer` to also write to a file / S3 / artifact store in addition to sending to WS.
+* **Backpressure**: This code will stream line-by-line. If clients are slow, the worker threads may block on `session.sendMessage`. You can improve by buffering lines and using async send or dropping when queue is full.
+* **TLS / Auth**: For production, secure the WebSocket endpoint (CORS/origins, JWT auth, etc.) and limit which users can request logs.
+
+---
+
+# 7) Quick checklist to drop into your project
+
+* Add dependencies to `pom.xml`.
+* Add `application.yml` properties (adjust caps).
+* Add Java files under your package tree and wire them in Spring Boot (component scan).
+* Ensure Kubernetes credentials/permissions (kubeconfig or ServiceAccount) are available.
+* Run and connect with the test HTML snippet.
+
+---
+
+If you want, I can:
+
+* Convert the WebSocket handler to STOMP + SockJS (if you prefer subscribe/publish model),
+* Add a REST endpoint that starts a stream server-side and returns a short-lived session token or stream id (for automation flows),
+* Add file-capture support (write streamed logs to a file + return file download link),
+* Or provide a `kubectl` fallback implementation instead of Fabric8.
+
+Tell me which of those you want and I’ll extend the code (I’ll just add it directly — no waiting).
