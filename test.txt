@@ -295,7 +295,6 @@ This handler accepts websocket connections at `/ws/logs` and expects query param
 Example connect URL:
 `ws://your-host/ws/logs?pod=my-pod&namespace=default&durationSeconds=120&tailLines=300`
 
-```java
 package com.example.k8slogs.websocket;
 
 import com.example.k8slogs.config.LogProperties;
@@ -308,6 +307,8 @@ import org.springframework.web.socket.handler.TextWebSocketHandler;
 import java.net.URI;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.UUID;
 
 public class LogWebSocketHandler extends TextWebSocketHandler {
     private static final Logger logger = LoggerFactory.getLogger(LogWebSocketHandler.class);
@@ -348,7 +349,9 @@ public class LogWebSocketHandler extends TextWebSocketHandler {
         tailLines = Math.min(tailLines, logProperties.getLogs().getMaxTailLines());
         durationSeconds = Math.min(durationSeconds, logProperties.getLogs().getMaxDurationSeconds());
 
-        // start streaming logs, each line sent as a websocket TextMessage
+        // Use an AtomicReference so the lambda can refer to the stream id even though it is assigned after the call.
+        final AtomicReference<UUID> streamIdRef = new AtomicReference<>();
+
         UUID streamId = logService.streamPodLogs(
                 namespace,
                 pod,
@@ -362,14 +365,24 @@ public class LogWebSocketHandler extends TextWebSocketHandler {
                         }
                     } catch (Exception e) {
                         logger.warn("Failed to send message to ws session {}, closing stream", session.getId(), e);
-                        // attempt to close session and cancel stream
                         try { session.close(CloseStatus.SERVER_ERROR); } catch (Exception ignored) {}
-                        logService.cancelStream(streamId);
+                        // cancel only if stream id is available
+                        UUID sid = streamIdRef.get();
+                        if (sid != null) {
+                            try {
+                                logService.cancelStream(sid);
+                            } catch (Exception cancelEx) {
+                                logger.warn("Error cancelling stream {} after websocket send failure", sid, cancelEx);
+                            }
+                        }
                     }
                 }
         );
 
+        // set the reference AFTER obtaining the stream id
+        streamIdRef.set(streamId);
         sessionToStream.put(session.getId(), streamId);
+
         logger.info("Started log stream {} for ws session {} pod={}/{} container={} duration={}s tailLines={}",
                 streamId, session.getId(), namespace, pod, container, durationSeconds, tailLines);
     }
@@ -398,7 +411,11 @@ public class LogWebSocketHandler extends TextWebSocketHandler {
     public void handleTransportError(WebSocketSession session, Throwable exception) {
         UUID streamId = sessionToStream.remove(session.getId());
         if (streamId != null) {
-            logService.cancelStream(streamId);
+            try {
+                logService.cancelStream(streamId);
+            } catch (Exception e) {
+                logger.warn("Error cancelling stream {} after transport error", streamId, e);
+            }
         }
         try { session.close(CloseStatus.SERVER_ERROR); } catch (Exception ignore) {}
         logger.error("Transport error on session {}, closed session and canceled stream {}", session.getId(), streamId, exception);
