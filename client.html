@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>K8s Log WebSocket Client</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; margin: 20px; background:#f7fafc; color:#111827; }
+    h1 { font-size: 20px; margin-bottom: 8px; }
+    .controls { margin-bottom: 12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    button { padding:8px 12px; border-radius:6px; border:1px solid #d1d5db; background:#fff; cursor:pointer; }
+    button:disabled { opacity:0.5; cursor:not-allowed; }
+    .status { font-size: 13px; padding:6px 10px; border-radius:6px; border:1px solid #e5e7eb; background:#fff; }
+    .panel { background:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:12px; box-shadow: 0 1px 2px rgba(0,0,0,0.03); }
+    #logArea { height: 360px; overflow:auto; padding:8px; font-family: monospace; background:#0b1220; color:#e6edf3; border-radius:6px; }
+    .meta { font-size:13px; color:#374151; margin-top:8px; display:flex; gap:12px; align-items:center; }
+    .small { font-size:12px; color:#6b7280; }
+    .line { white-space:pre-wrap; padding:2px 0; border-bottom: 1px solid rgba(255,255,255,0.02); }
+    .ts { color:#9ca3af; margin-right:8px; font-size:12px; }
+  </style>
+</head>
+<body>
+  <h1>Kubernetes Pod Logs — WebSocket Client</h1>
+
+  <div class="panel">
+    <div class="controls">
+      <button id="btnConnect">Connect (stream 5s)</button>
+      <button id="btnDisconnect" disabled>Disconnect</button>
+      <button id="btnSave" disabled>Save logs</button>
+      <div class="status" id="connectionStatus">Status: <strong id="statusText">DISCONNECTED</strong></div>
+    </div>
+
+    <div class="meta">
+      <div class="small">Pod: <strong id="metaPod">crdb-account-consumer-56f8b98b7d-mp9xc</strong></div>
+      <div class="small">Namespace: <strong id="metaNs">crdb-account-consumer-qa</strong></div>
+      <div class="small">Duration: <strong id="metaDur">5s</strong></div>
+      <div class="small">Tail lines: <strong id="metaTail">100</strong></div>
+      <div class="small">Received: <strong id="metaCount">0</strong></div>
+    </div>
+
+    <hr/>
+
+    <div id="logArea" aria-live="polite"></div>
+
+    <div style="margin-top:10px;" class="small">Open this page in a browser on the machine where you can reach <code>ws://localhost:8182</code>. If your server uses TLS/HTTPS and WSS, change protocol accordingly.</div>
+  </div>
+
+<script>
+(() => {
+  // Config (as requested)
+  const host = window.location.hostname || 'localhost';
+  // Force localhost:8182 per your requirement:
+  const wsHost = 'localhost:8182';
+  const path = '/ws/logs';
+  const pod = 'crdb-account-consumer-56f8b98b7d-mp9xc';
+  const namespace = 'crdb-account-consumer-qa';
+  const durationSeconds = 5;   // requested
+  const tailLines = 100;       // requested
+
+  const btnConnect = document.getElementById('btnConnect');
+  const btnDisconnect = document.getElementById('btnDisconnect');
+  const btnSave = document.getElementById('btnSave');
+  const statusText = document.getElementById('statusText');
+  const logArea = document.getElementById('logArea');
+  const metaCount = document.getElementById('metaCount');
+
+  const metaPod = document.getElementById('metaPod');
+  const metaNs = document.getElementById('metaNs');
+  const metaDur = document.getElementById('metaDur');
+  const metaTail = document.getElementById('metaTail');
+
+  metaPod.textContent = pod;
+  metaNs.textContent = namespace;
+  metaDur.textContent = durationSeconds + 's';
+  metaTail.textContent = tailLines;
+
+  let ws = null;
+  let receivedLines = [];
+  let lineCount = 0;
+  let autoCloseTimer = null;
+
+  function buildUrl() {
+    const q = new URLSearchParams({
+      pod: pod,
+      namespace: namespace,
+      durationSeconds: String(durationSeconds),
+      tailLines: String(tailLines)
+    });
+    return `ws://${wsHost}${path}?${q.toString()}`;
+  }
+
+  function appendLine(text) {
+    lineCount++;
+    metaCount.textContent = lineCount;
+    const el = document.createElement('div');
+    el.className = 'line';
+    const ts = document.createElement('span');
+    ts.className = 'ts';
+    ts.textContent = new Date().toISOString();
+    el.appendChild(ts);
+    const msg = document.createElement('span');
+    msg.textContent = ' ' + text;
+    el.appendChild(msg);
+    logArea.appendChild(el);
+    // keep only last ~5000 lines in DOM to avoid memory blow up
+    if (logArea.children.length > 10000) {
+      logArea.removeChild(logArea.firstChild);
+    }
+    logArea.scrollTop = logArea.scrollHeight;
+    receivedLines.push(`${ts.textContent} ${text}`);
+  }
+
+  function setStatus(s) {
+    statusText.textContent = s;
+  }
+
+  function start() {
+    if (ws) return;
+    const url = buildUrl();
+    setStatus('CONNECTING');
+    btnConnect.disabled = true;
+    btnDisconnect.disabled = false;
+
+    try {
+      ws = new WebSocket(url);
+    } catch (err) {
+      setStatus('ERROR (bad URL)');
+      console.error(err);
+      btnConnect.disabled = false;
+      btnDisconnect.disabled = true;
+      ws = null;
+      return;
+    }
+
+    ws.onopen = () => {
+      setStatus('OPEN');
+      appendLine('[INFO] WebSocket opened to ' + url);
+      btnSave.disabled = true; // will enable after we have some logs
+      // Auto-close slightly after requested duration to ensure capture completes on server
+      const bufferSeconds = 1.5;
+      autoCloseTimer = setTimeout(() => {
+        appendLine('[INFO] Auto-closing socket after ' + (durationSeconds + bufferSeconds) + 's (client-side)');
+        stop();
+      }, (durationSeconds + bufferSeconds) * 1000);
+    };
+
+    ws.onmessage = (evt) => {
+      appendLine(evt.data);
+      btnSave.disabled = false;
+    };
+
+    ws.onerror = (err) => {
+      setStatus('ERROR');
+      appendLine('[ERROR] WebSocket error: ' + (err && err.message ? err.message : JSON.stringify(err)));
+      console.error('ws error', err);
+    };
+
+    ws.onclose = (evt) => {
+      setStatus('CLOSED');
+      appendLine('[INFO] WebSocket closed (code=' + (evt.code || '') + ', reason=' + (evt.reason || '') + ')');
+      cleanup();
+    };
+  }
+
+  function stop() {
+    if (!ws) return;
+    try {
+      ws.close(1000, 'Client closed');
+    } catch (e) {
+      console.warn('close error', e);
+    }
+    // cleanup will be called by onclose
+  }
+
+  function cleanup() {
+    if (autoCloseTimer) {
+      clearTimeout(autoCloseTimer);
+      autoCloseTimer = null;
+    }
+    ws = null;
+    btnConnect.disabled = false;
+    btnDisconnect.disabled = true;
+  }
+
+  function saveLogs() {
+    if (receivedLines.length === 0) {
+      alert('No logs received to save.');
+      return;
+    }
+    const blob = new Blob([receivedLines.join('\n')], { type: 'text/plain;charset=utf-8' });
+    const filename = `logs_${pod}_${namespace}_${new Date().toISOString().replace(/[:.]/g,'-')}.txt`;
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(a.href);
+      a.remove();
+    }, 2000);
+  }
+
+  btnConnect.addEventListener('click', () => {
+    // clear previous view
+    logArea.innerHTML = '';
+    receivedLines = [];
+    lineCount = 0;
+    metaCount.textContent = 0;
+    start();
+  });
+
+  btnDisconnect.addEventListener('click', () => {
+    appendLine('[INFO] Manual disconnect requested');
+    stop();
+  });
+
+  btnSave.addEventListener('click', saveLogs);
+
+  // Also allow pressing Escape to disconnect
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      stop();
+    }
+  });
+
+  // show example URL in console for debugging
+  console.info('WebSocket URL ->', buildUrl());
+})();
+</script>
+</body>
+</html>
