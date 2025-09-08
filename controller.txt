@@ -1,0 +1,8 @@
+@Controller
+public class SpaForwardController {
+
+    @GetMapping({"/test-consumer", "/test-consumer/**/{path:[^\\.]*}"})
+    public String forward() {
+        return "forward:/test-consumer/index.html";
+    }
+}
