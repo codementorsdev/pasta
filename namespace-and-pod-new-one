@@ -1,0 +1,41 @@
+package com.example.automation.service;
+
+import io.fabric8.kubernetes.api.model.Namespace;
+import io.fabric8.kubernetes.api.model.Pod;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+public class KubernetesMetadataService {
+
+    private final KubernetesClient client;
+
+    public KubernetesMetadataService(KubernetesClient client) {
+        this.client = client;
+    }
+
+    @Cacheable("namespaces")
+    public List<String> getNamespaces() {
+        return client.namespaces()
+                .list()
+                .getItems()
+                .stream()
+                .map(ns -> ns.getMetadata().getName())
+                .collect(Collectors.toList());
+    }
+
+    @Cacheable(value = "pods", key = "#namespace")
+    public List<String> getPods(String namespace) {
+        return client.pods()
+                .inNamespace(namespace)
+                .list()
+                .getItems()
+                .stream()
+                .map(pod -> pod.getMetadata().getName())
+                .collect(Collectors.toList());
+    }
+}
