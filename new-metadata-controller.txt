@@ -1,0 +1,33 @@
+package com.example.automation.controller;
+
+import com.example.automation.service.KubernetesMetadataService;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/k8s")
+public class KubernetesMetadataController {
+
+    private final KubernetesMetadataService service;
+
+    public KubernetesMetadataController(KubernetesMetadataService service) {
+        this.service = service;
+    }
+
+    @GetMapping("/namespaces")
+    public List<String> getNamespaces() {
+        return service.getNamespaces();
+    }
+
+    @GetMapping("/namespaces/{namespace}/pods")
+    public List<String> getPods(@PathVariable String namespace) {
+        return service.getPods(namespace);
+    }
+
+    @GetMapping("/namespaces/{namespace}/pods/{podName}/containers")
+    public List<String> getContainers(@PathVariable String namespace,
+                                      @PathVariable String podName) {
+        return service.getContainers(namespace, podName);
+    }
+}
