@@ -1,0 +1,44 @@
+import io.kubernetes.client.openapi.ApiException;
+import io.kubernetes.client.openapi.apis.CoreV1Api;
+import io.kubernetes.client.openapi.models.V1NamespaceList;
+import io.kubernetes.client.openapi.models.V1PodList;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+public class KubernetesMetadataService {
+
+    private final CoreV1Api coreV1Api;
+
+    public KubernetesMetadataService(CoreV1Api coreV1Api) {
+        this.coreV1Api = coreV1Api;
+    }
+
+    @Cacheable("namespaces")
+    public List<String> getNamespaces() throws IOException, ApiException {
+        V1NamespaceList namespaceList = coreV1Api.listNamespace(
+                null, null, null, null,
+                null, null, null, null, null, false
+        );
+        return namespaceList.getItems()
+                .stream()
+                .map(ns -> ns.getMetadata().getName())
+                .collect(Collectors.toList());
+    }
+
+    @Cacheable(value = "pods", key = "#namespace")
+    public List<String> getPods(String namespace) throws IOException, ApiException {
+        V1PodList podList = coreV1Api.listNamespacedPod(
+                namespace, null, null, null, null,
+                null, null, null, null, null, false
+        );
+        return podList.getItems()
+                .stream()
+                .map(pod -> pod.getMetadata().getName())
+                .collect(Collectors.toList());
+    }
+}
